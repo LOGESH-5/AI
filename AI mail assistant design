@@ -1,0 +1,337 @@
+import os
+import re
+import imaplib
+import email
+import html
+import asyncio
+import heapq
+import time
+from datetime import datetime
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from pydantic import BaseModel
+from sqlmodel import SQLModel, Field, create_engine, Session, select
+from transformers import pipeline
+import openai
+import numpy as np
+import faiss
+import json
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./emails.db")
+IMAP_SERVER = os.getenv("IMAP_SERVER", "imap.gmail.com")
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
+IMAP_USER = os.getenv("IMAP_USER", "")
+IMAP_PASS = os.getenv("IMAP_PASS", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+openai.api_key = OPENAI_API_KEY
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
+sentiment_pipe = pipeline("sentiment-analysis")
+PHONE_RE = re.compile(r'(\+?\d{1,3}[-.\s]?)?(\d{6,15})')
+EMAIL_RE = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
+URGENT_KEYWORDS = ['urgent','immediately','asap','critical','cannot access','payment failed','down','blocked','suspend','suspended']
+SYSTEM_PROMPT = "You are a helpful professional customer support assistant. Be concise, empathetic, and do not invent facts."
+
+class Email(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    message_id: Optional[str]
+    sender_email: Optional[str]
+    subject: Optional[str]
+    body: Optional[str]
+    received_at: Optional[datetime]
+    sentiment: Optional[str]
+    priority: Optional[str]
+    extracted: Optional[str]
+    rag_context: Optional[str]
+    draft_reply: Optional[str]
+    status: Optional[str] = "pending"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class KBDoc(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    title: str
+    content: str
+    embedding: Optional[str]
+
+class EmailCreate(BaseModel):
+    message_id: Optional[str]
+    sender_email: Optional[str]
+    subject: Optional[str]
+    body: Optional[str]
+    received_at: Optional[datetime]
+
+class ReplyRequest(BaseModel):
+    email_id: int
+    send: bool = False
+    edited_reply: Optional[str] = None
+
+SQLModel.metadata.create_all(engine)
+
+class PriorityQueue:
+    def __init__(self):
+        self._heap = []
+    def push(self, email_obj: Dict[str, Any], urgent: bool):
+        timestamp = time.time()
+        score = -(100000 if urgent else 0) + timestamp / 1e6
+        heapq.heappush(self._heap, (score, email_obj))
+    def pop(self):
+        if not self._heap:
+            return None
+        return heapq.heappop(self._heap)[1]
+    def list_all(self):
+        return [item[1] for item in sorted(self._heap)]
+
+pq = PriorityQueue()
+app = FastAPI()
+
+def clean_subject(subject):
+    try:
+        decoded = email.header.decode_header(subject)[0]
+        text = decoded[0].decode(decoded[1]) if isinstance(decoded[0], bytes) else decoded[0]
+        return text
+    except Exception:
+        return subject or ""
+
+def html_to_text(html_body):
+    text = re.sub(r'<[^>]+>', '', html_body)
+    return html.unescape(text)
+
+def fetch_support_emails_imap():
+    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+    conn.login(IMAP_USER, IMAP_PASS)
+    conn.select("INBOX")
+    typ, data = conn.search(None, '(UNSEEN)')
+    ids = data[0].split()
+    results = []
+    for num in ids:
+        typ, msg_data = conn.fetch(num, '(RFC822)')
+        if not msg_data or not msg_data[0]:
+            continue
+        msg = email.message_from_bytes(msg_data[0][1])
+        subject = clean_subject(msg.get("Subject",""))
+        sender = msg.get("From","")
+        date = msg.get("Date")
+        try:
+            dt = email.utils.parsedate_to_datetime(date) if date else datetime.utcnow()
+        except Exception:
+            dt = datetime.utcnow()
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                cdisp = str(part.get("Content-Disposition"))
+                if ctype == "text/plain" and "attachment" not in cdisp:
+                    body = part.get_payload(decode=True).decode(errors="ignore")
+                    break
+                if ctype == "text/html" and not body:
+                    html_body = part.get_payload(decode=True).decode(errors="ignore")
+                    body = html_to_text(html_body)
+        else:
+            body = msg.get_payload(decode=True).decode(errors="ignore")
+        if re.search(r'\b(support|query|request|help|issue|ticket|problem|unable)\b', subject, re.I) or re.search(r'\b(support|query|request|help|issue|ticket|problem|unable)\b', body, re.I):
+            results.append({
+                "message_id": msg.get("Message-ID"),
+                "sender": sender,
+                "subject": subject,
+                "body": body,
+                "received_at": dt
+            })
+    conn.logout()
+    return results
+
+def extract_info(text: str):
+    phones = PHONE_RE.findall(text)
+    phones = ["".join(p) for p in phones]
+    emails = EMAIL_RE.findall(text)
+    return {"phones": list(dict.fromkeys(phones)), "emails": list(dict.fromkeys(emails))}
+
+def get_sentiment(text: str):
+    try:
+        r = sentiment_pipe(text[:512])[0]
+        label = r['label'].lower()
+        if label.startswith('neg'):
+            return 'negative'
+        if label.startswith('pos'):
+            return 'positive'
+        return 'neutral'
+    except Exception:
+        return 'neutral'
+
+def detect_priority(subject: str, body: str, sentiment: str):
+    text = (subject + " " + body).lower()
+    for kw in URGENT_KEYWORDS:
+        if kw in text:
+            return 'urgent'
+    if sentiment == 'negative' and any(word in text for word in ['cannot','unable','failed','payment']):
+        return 'urgent'
+    return 'not_urgent'
+
+def get_openai_embedding(text: str):
+    resp = openai.Embedding.create(input=text, model="text-embedding-3-small")
+    return np.array(resp.data[0].embedding, dtype='float32')
+
+def build_faiss_index():
+    with Session(engine) as s:
+        docs = s.exec(select(KBDoc)).all()
+    vecs = []
+    id_map = []
+    for d in docs:
+        if d.embedding:
+            emb = np.frombuffer(bytes.fromhex(d.embedding), dtype='float32')
+            vecs.append(emb)
+            id_map.append(d.id)
+    if not vecs:
+        return None, []
+    dim = len(vecs[0])
+    index = faiss.IndexFlatL2(dim)
+    index.add(np.stack(vecs))
+    return index, id_map
+
+def rag_retrieve(email_text: str, k=3):
+    index, id_map = build_faiss_index()
+    if index is None:
+        return []
+    emb = get_openai_embedding(email_text)
+    D, I = index.search(np.array([emb]), k)
+    results = []
+    for idx in I[0]:
+        if idx < 0 or idx >= len(id_map):
+            continue
+        doc_id = id_map[idx]
+        with Session(engine) as s:
+            doc = s.get(KBDoc, doc_id)
+        if doc:
+            results.append({"id": doc.id, "title": doc.title, "content": doc.content})
+    return results
+
+def build_prompt(email: Dict[str, Any], extracted: Dict[str, Any], rag_docs: List[Dict[str, Any]]):
+    kb_snippets = "\n\n---\n".join([f"{d['title']}\n{d['content'][:800]}" for d in rag_docs])
+    prompt = f"""
+Customer email:
+Subject: {email.get('subject')}
+From: {email.get('sender')}
+Body:
+{email.get('body')}
+
+Extracted: {json.dumps(extracted)}
+
+Relevant KB:
+{kb_snippets}
+
+Write a professional reply in 4 short paragraphs:
+1) Empathy/acknowledgment if negative sentiment
+2) Quick summary of issue
+3) Proposed immediate action / solution and steps
+4) Closing + signature
+Constraints: Keep under 250 words. If missing critical info, ask for it.
+"""
+    return prompt
+
+def generate_reply_openai(prompt: str):
+    resp = openai.ChatCompletion.create(model="gpt-4o-mini", messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":prompt}], max_tokens=400)
+    return resp.choices[0].message.content
+
+async def process_and_store(email_obj: Dict[str, Any]):
+    extracted = extract_info(email_obj.get("body",""))
+    sentiment = get_sentiment(email_obj.get("body",""))
+    priority = detect_priority(email_obj.get("subject",""), email_obj.get("body",""), sentiment)
+    rag_docs = rag_retrieve(email_obj.get("body",""))
+    prompt = build_prompt(email_obj, extracted, rag_docs)
+    try:
+        draft = generate_reply_openai(prompt)
+    except Exception:
+        draft = ""
+    with Session(engine) as s:
+        e = Email(message_id=email_obj.get("message_id"), sender_email=email_obj.get("sender"), subject=email_obj.get("subject"), body=email_obj.get("body"), received_at=email_obj.get("received_at"), sentiment=sentiment, priority=priority, extracted=json.dumps(extracted), rag_context=json.dumps(rag_docs), draft_reply=draft, status="pending")
+        s.add(e)
+        s.commit()
+        s.refresh(e)
+    pq.push({"email_id": e.id}, urgent=(priority=="urgent"))
+
+@app.post("/start_fetch")
+async def start_fetch(background_tasks: BackgroundTasks):
+    background_tasks.add_task(fetch_process_cycle)
+    return {"status":"started"}
+
+async def fetch_process_cycle():
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            items = await loop.run_in_executor(None, fetch_support_emails_imap)
+            tasks = [process_and_store(it) for it in items]
+            if tasks:
+                await asyncio.gather(*tasks)
+        except Exception:
+            pass
+        await asyncio.sleep(30)
+
+@app.get("/emails")
+def list_emails(limit: int = 50, offset: int = 0):
+    with Session(engine) as s:
+        q = s.exec(select(Email).order_by(Email.priority.desc(), Email.received_at.desc()).offset(offset).limit(limit)).all()
+        return q
+
+@app.get("/emails/{email_id}")
+def get_email(email_id: int):
+    with Session(engine) as s:
+        e = s.get(Email, email_id)
+        if not e:
+            raise HTTPException(status_code=404, detail="not found")
+        return e
+
+@app.post("/emails/{email_id}/reply")
+def reply_email(email_id: int, payload: ReplyRequest):
+    with Session(engine) as s:
+        e = s.get(Email, email_id)
+        if not e:
+            raise HTTPException(status_code=404, detail="not found")
+        reply_text = payload.edited_reply or e.draft_reply or ""
+        if payload.send:
+            if not IMAP_USER or not IMAP_PASS:
+                raise HTTPException(status_code=500, detail="mail credentials missing")
+            from email.message import EmailMessage
+            import smtplib
+            msg = EmailMessage()
+            msg["Subject"] = f"Re: {e.subject or ''}"
+            msg["From"] = IMAP_USER
+            msg["To"] = e.sender_email
+            msg.set_content(reply_text)
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+                smtp.login(IMAP_USER, IMAP_PASS)
+                smtp.send_message(msg)
+            e.status = "sent"
+        else:
+            e.draft_reply = reply_text
+        e.updated_at = datetime.utcnow()
+        s.add(e)
+        s.commit()
+        s.refresh(e)
+    return {"status": e.status, "draft": e.draft_reply}
+
+@app.post("/kb")
+def add_kb(doc: KBDoc):
+    emb = get_openai_embedding(doc.content)
+    hex_emb = emb.tobytes().hex()
+    new = KBDoc(title=doc.title, content=doc.content, embedding=hex_emb)
+    with Session(engine) as s:
+        s.add(new)
+        s.commit()
+        s.refresh(new)
+    return new
+
+@app.get("/queue")
+def view_queue():
+    return {"queue": pq.list_all()}
+
+@app.post("/process_next")
+def process_next():
+    item = pq.pop()
+    if not item:
+        return {"status":"empty"}
+    email_id = item.get("email_id")
+    with Session(engine) as s:
+        e = s.get(Email, email_id)
+        if not e:
+            return {"status":"not_found"}
+        return e
